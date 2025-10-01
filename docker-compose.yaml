@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  lung-classifier:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models:ro
+    environment:
+      - PYTHONUNBUFFERED=1

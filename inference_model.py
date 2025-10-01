@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 _model = None
-MODEL_PATH = Path("lung_abnormality_model.pth")
+MODEL_PATH = Path("models/sam_vit_b_01ec64.pth")
 
 class SimpleLungClassifier(nn.Module):
     def __init__(self):

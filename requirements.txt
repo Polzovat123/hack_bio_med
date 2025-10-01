@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydicom
+numpy
+torch
+torchvision
+segment-anything
+python-multipart
