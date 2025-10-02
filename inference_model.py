@@ -1,92 +1,146 @@
+from typing import Dict, Any, List, Optional
 import numpy as np
 import pydicom
 from pathlib import Path
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import transforms
+import time
+from segment_anything import sam_model_registry, SamPredictor
 
-_model = None
-MODEL_PATH = Path("models/sam_vit_b_01ec64.pth")
+# Конфигурация
+SAM_CHECKPOINT = Path("models/sam_vit_b_01ec64.pth")
+MODEL_TYPE = "vit_b"
 
-class SimpleLungClassifier(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.fc1 = nn.Linear(32 * 64 * 64, 128)  # предполагаем вход 256x256 → после 2 пулингов: 64x64
-        self.fc2 = nn.Linear(128, 1)
-        self.dropout = nn.Dropout(0.5)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = torch.flatten(x, 1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = torch.sigmoid(self.fc2(x))
-        return x
+# Глобальный predictor (будет инициализирован один раз)
+_sam_predictor: Optional[SamPredictor] = None
 
 
-def load_and_preprocess_dicom(dcm_path: Path) -> np.ndarray:
+def hu_to_rgb_uint8(img_hu: np.ndarray) -> np.ndarray:
+    """
+    Преобразует HU-изображение в RGB uint8 для SAM.
+    """
+    # Применяем окно лёгких
+    img_windowed = np.clip(img_hu, -1350, 150)
+    img_normalized = (img_windowed - (-1350)) / (150 - (-1350))  # [0, 1]
+    img_uint8 = (img_normalized * 255).astype(np.uint8)  # [0, 255], shape (H, W)
+
+    # Преобразуем в RGB: копируем канал 3 раза
+    img_rgb = np.stack([img_uint8, img_uint8, img_uint8], axis=-1)  # (H, W, 3)
+    return img_rgb
+
+
+def init_sam():
+    """Инициализирует SAM один раз при старте."""
+    global _sam_predictor
+    if _sam_predictor is None:
+        if not SAM_CHECKPOINT.exists():
+            raise FileNotFoundError(f"SAM checkpoint not found at {SAM_CHECKPOINT}")
+        print(f"Loading SAM model from {SAM_CHECKPOINT}")
+        sam = sam_model_registry[MODEL_TYPE](checkpoint=str(SAM_CHECKPOINT))
+        sam.eval()
+        _sam_predictor = SamPredictor(sam)
+    return _sam_predictor
+
+
+def load_dicom_with_metadata(dcm_path: Path) -> tuple[np.ndarray, dict]:
+    """Загружает DICOM и возвращает (изображение в HU, метаданные)."""
     ds = pydicom.dcmread(dcm_path)
     img = ds.pixel_array.astype(np.float32)
 
     if hasattr(ds, 'RescaleSlope') and hasattr(ds, 'RescaleIntercept'):
-        img = img * ds.RescaleSlope + ds.RescaleIntercept
+        img = img * float(ds.RescaleSlope) + float(ds.RescaleIntercept)
 
-    img = np.clip(img, -1000, 400)
-    img = (img + 1000) / 1400.0  # [0, 1]
-
-    return img
-
-
-def preprocess_for_model(img: np.ndarray, target_size=(256, 256)) -> torch.Tensor:
-    img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-    resized = torch.nn.functional.interpolate(img_tensor, size=target_size, mode='bilinear', align_corners=False)
-    return resized  # shape: [1, 1, 256, 256]
+    metadata = {
+        "study_uid": str(ds.get("StudyInstanceUID", "")),
+        "series_uid": str(ds.get("SeriesInstanceUID", ""))
+    }
+    return img, metadata
 
 
-def get_model():
-    global _model
-    if _model is None:
-        if MODEL_PATH.exists():
-            print(f"Загружаем модель из {MODEL_PATH}")
-            _model = SimpleLungClassifier()
-            _model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
-            _model.eval()
-        else:
-            raise FileNotFoundError(f"Модель не найдена по пути: {MODEL_PATH}. Обучите и сохраните её сначала!")
-    return _model
-
-
-def save_model(model: nn.Module, path: Path = MODEL_PATH):
-    torch.save(model.state_dict(), path)
-    print(f"Модель сохранена в {path}")
-
-
-def run_inference(dcm_path: Path) -> dict:
+def auto_generate_prompts_from_hu(img_hu: np.ndarray) -> Optional[Dict[str, np.ndarray]]:
     """
-    Выполняет инференс модели на DICOM-изображении.
-    Возвращает: {"is_abnormal": bool, "confidence": float}
+    Автоматически генерирует подсказки на основе HU:
+    - Ищет связные компоненты с HU от -600 до +100 (подозрительные узелки/инфильтраты)
+    - Берёт центроид каждой крупной области (>50 пикселей)
     """
-    # Загрузка и предобработка изображения
-    img = load_and_preprocess_dicom(dcm_path)
-    input_tensor = preprocess_for_model(img)
+    from scipy import ndimage
 
-    # Загрузка модели
-    model = get_model()
+    # Маска подозрительных тканей: узелки, инфильтраты
+    mask = (img_hu >= -600) & (img_hu <= 100)
 
-    # Инференс
-    with torch.no_grad():
-        output = model(input_tensor)
-        confidence = output.item()  # вероятность класса "патология"
+    # Убираем очень маленькие области
+    labeled, num_features = ndimage.label(mask)
+    if num_features == 0:
+        return None
 
-    is_abnormal = confidence > 0.5
+    prompts = {"points": [], "labels": []}
+    for i in range(1, num_features + 1):
+        region_mask = labeled == i
+        if region_mask.sum() < 50:  # меньше 50 пикселей — игнорируем
+            continue
+        # Центроид области
+        coords = np.argwhere(region_mask)
+        centroid = coords.mean(axis=0).astype(int)  # [row, col]
+        # SAM ожидает [x, y] → [col, row]
+        prompts["points"].append([int(centroid[1]), int(centroid[0])])
+        prompts["labels"].append(1)
+
+    if not prompts["points"]:
+        return None
 
     return {
-        "is_abnormal": is_abnormal,
-        "confidence": float(confidence)
+        "point_coords": np.array(prompts["points"]),
+        "point_labels": np.array(prompts["labels"])
     }
 
+
+def run_sam_on_image(img_rgb: np.ndarray, prompts: Optional[Dict] = None) -> tuple[bool, float]:
+    predictor = _sam_predictor
+    if predictor is None:
+        raise RuntimeError("SAM not initialized")
+
+    predictor.set_image(img_rgb)  # ← (H, W, 3) uint8
+
+    if prompts is None:
+        return False, 0.0
+
+    try:
+        masks, scores, _ = predictor.predict(
+            point_coords=prompts["point_coords"],
+            point_labels=prompts["point_labels"],
+            multimask_output=True
+        )
+        best_idx = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
+        mask_area = masks[best_idx].sum()
+        img_area = masks[best_idx].size
+        is_abnormal = mask_area > (img_area * 0.005)
+        return is_abnormal, best_score
+    except Exception as e:
+        print(f"SAM inference error: {e}")
+        return False, 0.0
+
+
+def process_single_dicom(dcm_path: Path, original_filename: str) -> Dict[str, Any]:
+    start_time = time.time()
+
+    img_hu, metadata = load_dicom_with_metadata(dcm_path)
+    img_rgb = hu_to_rgb_uint8(img_hu)
+    prompts = auto_generate_prompts_from_hu(img_hu)
+
+    is_abnormal_np, confidence_np = run_sam_on_image(img_rgb, prompts)
+
+    is_abnormal = bool(is_abnormal_np)
+    confidence = float(confidence_np)
+    processing_time = time.time() - start_time
+
+    return {
+        "probability_of_pathology": confidence,
+        "pathology": is_abnormal,
+        "most_dangerous_pathology_type": "nodule" if is_abnormal else None,
+        "pathology_localization": "lung" if is_abnormal else None,
+        "path_to_study": original_filename,  # ← вот здесь!
+        "study_uid": str(metadata["study_uid"]),
+        "series_uid": str(metadata["series_uid"]),
+        "processing_status": "completed",
+        "time_of_processing": round(float(processing_time), 3)
+    }
